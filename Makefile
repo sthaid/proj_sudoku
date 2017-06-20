@@ -2,7 +2,7 @@
 TARGETS = sudoku
 
 CC = gcc
-CFLAGS = -g -O2 -Wall 
+CFLAGS = -g -O2 -pthread -Wall -lrt
 
 all: $(TARGETS)
 

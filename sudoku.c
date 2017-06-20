@@ -26,17 +26,23 @@ SOFTWARE.
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <pthread.h>
+#include <signal.h>
 #include <assert.h>
 
 //
 // defines
 //
 
-//#define DEBUG_DUPLICATES
+// #define VERIFY_SOLUTIONS
 
 #define NO_VALUE 255
 
 #define MAX_SOLUTIONS_INFINITE 0
+
+#define DEFAULT_MAX_THREADS    4
+#define DEFAULT_PRINT_INTERVAL 1000000
+#define DEFAULT_MAX_SOLUTIONS  MAX_SOLUTIONS_INFINITE
 
 #define ROW(locidx) (locidx / 9)
 #define COL(locidx) (locidx % 9)
@@ -56,52 +62,84 @@ typedef struct {
 // variables
 //
 
-uint32_t siblings[81][20];
-uint8_t  pv2val[513];
-uint64_t total_solutions;
-uint64_t max_solutions;
+uint32_t max_threads    = DEFAULT_MAX_THREADS;      // params
+uint32_t print_interval = DEFAULT_PRINT_INTERVAL;
+uint64_t max_solutions  = DEFAULT_MAX_SOLUTIONS;
+
+uint32_t siblings[81][20];                          // siblings to a location
+uint8_t  pv2val[513];                               // convert possible value bitmask to value
+
+uint64_t total_solutions;                           // stats
+uint32_t num_threads;
+uint64_t num_thread_creates; 
+uint64_t find_solutions_start_us;
+uint64_t find_solutions_end_us;
+
+bool     find_solutions_done;                        // set true when find_solutions threads all done
 
 //
 // progotypes
 //
 
 void initialize(void);
-uint32_t find_solutions(puzzle_t p);
+void find_solutions(puzzle_t p, bool new_thread);
 void possible_values(puzzle_t * p, uint32_t locidx, uint32_t * pv, uint32_t * num_pv);
+void * find_solutions_thread(void * cx);
 void read_puzzle(puzzle_t * p, char * filename);
-void print_puzzle(puzzle_t * p, char * info_str);
+void print_puzzle(puzzle_t * p, bool print_stats, uint64_t ts);
 void verify_solution(puzzle_t * p);
+uint64_t microsec_timer(void);
+void sigint_register(void);
+bool sigint_check(void);
+void sigint_clear(void);
+char * numeric_str(uint64_t v, char * s);
 
 // -----------------  MAIN  ----------------------------------------
 
 int main(int argc, char ** argv)
 {
     puzzle_t puzzle;
-    char * filename;
-    uint32_t num_solutions;
+    char *filename, s[100];
+    uint64_t rate;
 
-    // set line bufferring, to facilitate deubg
+    // use line bufferring for stdout
     setlinebuf(stdout);
 
     // get args      
-    max_solutions = MAX_SOLUTIONS_INFINITE;
-    if (argc < 2 || argc > 3 ||
-        (argc == 3 && sscanf(argv[2], "%ld", &max_solutions) != 1))
+    if (argc < 2 || argc > 5 ||
+        (argc >= 3 && sscanf(argv[2], "%d", &max_threads) != 1) ||
+        (argc >= 4 && sscanf(argv[3], "%d", &print_interval) != 1) ||
+        (argc >= 5 && sscanf(argv[4], "%ld", &max_solutions) != 1))
     {
-        printf("usage: sudoku <filename> [<max_solution>]\n");
+        printf("usage: sudoku <filename> [<max_thread>] [<print_intvl>] [<max_solutions>]\n");
         return 0;
     }
     filename = argv[1];
 
     // print args
-    printf("Filename      = %s\n", filename);
-    if (max_solutions == MAX_SOLUTIONS_INFINITE) {
-        printf("Max_solutions = infinite\n");
-    } else {
-        printf("Max_solutions = %ld\n", max_solutions);
-    }
     printf("\n");
-        
+    printf("filename       = %s\n", filename);
+    printf("max_threads    = %d\n", max_threads);
+    printf("print_interval = %d\n", print_interval);
+    printf("max_solutions  = %s\n",
+           (max_solutions == MAX_SOLUTIONS_INFINITE 
+            ? "infinite" : (sprintf(s, "%ld", max_solutions),s)));
+    printf("\n");
+
+#if 0
+    // prompt to continue
+    char ans[2];
+    printf("<cr> to continue: ");
+    fgets(ans, sizeof(ans), stdin);
+    printf("\n");
+    if (ans[0] != '\n') {
+        return 0;
+    }
+#endif
+
+    // register for SIGINT
+    sigint_register();
+
     // initialize
     initialize();
 
@@ -111,8 +149,25 @@ int main(int argc, char ** argv)
 
     // find solutions
     printf("Solutions ...\n");
-    num_solutions = find_solutions(puzzle);
-    printf("Found %d solutions.\n", num_solutions);
+    find_solutions(puzzle, false);
+    while (!find_solutions_done) {
+        usleep(1000);
+    }
+
+    // if terminated due to ctrl c then print message
+    if (sigint_check()) {
+        printf("\n*** INTERRUPTED ***\n\n");
+    }
+
+    // print 
+    // - total number of solutions found
+    // - number of threads created 
+    // - rate that the solutions were found
+    rate = total_solutions * 1000000L / (find_solutions_end_us - find_solutions_start_us);
+    printf("total_solutions    = %s\n", numeric_str(total_solutions,s));
+    printf("num_thread_creates = %ld\n", num_thread_creates);
+    printf("solution_rate      = %s / sec\n", numeric_str(rate,s));
+    printf("\n");
 
     // terminate
     return 0;
@@ -147,17 +202,44 @@ void initialize(void)
 
 // -----------------  FIND SOLUTIONS  ------------------------------
 
-uint32_t find_solutions(puzzle_t p)
+void find_solutions(puzzle_t p, bool new_thread)
 {
-    uint32_t locidx, num_pv, pv, num_solutions;
-    bool     values_have_been_set;
-    uint32_t best_num_pv, best_locidx, best_pv;
-    uint8_t  trial_val;
-    char     info_str[10];
+    uint32_t   locidx, num_pv, pv;
+    uint32_t   best_num_pv, best_locidx, best_pv;
+    uint64_t   ts;
+    uint8_t    trial_val;
+    bool       values_have_been_set;
+    pthread_t  thread_id;
+    puzzle_t * p_copy;
 
-    // if the total number of solutions found exceeds limit then return
+    static pthread_mutex_t thread_create_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    // if interrupted then return
+    if (sigint_check()) {
+        return;
+    }
+
+    // if the total number of solutions found is at or exceeds the limit then return
     if (max_solutions != MAX_SOLUTIONS_INFINITE && total_solutions >= max_solutions) {
-        return 0;
+        return;
+    }
+
+    // if not currently executing in a newly created thrad and 
+    //    the number of threads running find_solutions is less than maximum 
+    // then
+    //   create a thread which will call find_solutions
+    //   return
+    // endif
+    if (!new_thread && num_threads < max_threads) {
+        pthread_mutex_lock(&thread_create_mutex);
+        if (num_threads < max_threads) {
+            p_copy = malloc(sizeof(puzzle_t));
+            *p_copy = p;
+            pthread_create(&thread_id, NULL, find_solutions_thread, p_copy);
+            pthread_mutex_unlock(&thread_create_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&thread_create_mutex);
     }
 
     // this section attempts to find a solution by determining
@@ -193,7 +275,7 @@ uint32_t find_solutions(puzzle_t p)
             possible_values(&p,locidx,&pv,&num_pv);   
 
             if (num_pv == 0) {
-                return 0;
+                return;
             } else if (num_pv == 1) {
                 p.value[locidx] = pv2val[pv];
                 p.num_no_value--;
@@ -206,18 +288,30 @@ uint32_t find_solutions(puzzle_t p)
         }
     } while (values_have_been_set);
 
-    // check if found a solution
-    // - keep track of the total number of solutions found
-    // - print the solution
-    // - verify the solution: if the solution is incorrect then this
-    //   is a bug in this program; and the verify_solution routine will
-    //   print an error message and exit the program
+    // if found a solution then ...
     if (p.num_no_value == 0) {
-        total_solutions++;
-        sprintf(info_str, " %ld", total_solutions);
-        print_puzzle(&p, info_str);
+#ifdef VERIFY_SOLUTIONS
+        // verify the solution: if the solution is incorrect then this
+        // is a bug in this program; and the verify_solution routine will
+        // print an error message and exit the program
         verify_solution(&p);
-        return 1;
+#endif
+
+        // keep track of the total number of solutions found
+        ts = __sync_add_and_fetch(&total_solutions,1);
+        if (max_solutions != MAX_SOLUTIONS_INFINITE && ts > max_solutions) {
+            __sync_sub_and_fetch(&total_solutions,1);
+            return;
+        }
+
+        // print the first solution and 
+        // print subsequent solutions at the print_interval
+        if ((ts % print_interval) == 0 || ts == 1) {
+            print_puzzle(&p, true, ts);
+        }
+
+        // return
+        return;
     }
 
     // assert that the above code has set best_num_pv, best_locidx, and best_pv
@@ -226,17 +320,13 @@ uint32_t find_solutions(puzzle_t p)
     // using the locidx with the least number of possible values, recursively
     // call find_solutions with that location set to each of the possible values
     // that the location can have
-    num_solutions = 0;
     p.num_no_value--;
     for (trial_val = 1; trial_val <= 9; trial_val++) { 
         if (best_pv & (1 << trial_val)) {
             p.value[best_locidx] = trial_val;
-            num_solutions += find_solutions(p);
+            find_solutions(p,false);
         }
     }
-
-    // return number of solutions
-    return num_solutions;
 }
 
 void possible_values(puzzle_t * p, uint32_t locidx, uint32_t * pv_arg, uint32_t * num_pv_arg)
@@ -248,7 +338,7 @@ void possible_values(puzzle_t * p, uint32_t locidx, uint32_t * pv_arg, uint32_t 
     uint8_t    sib_val;
 
     // determine the possible values that a location can have;
-    // returns 
+    // this routine returns 
     // - pv_arg: bitmask of the possilbe values
     // - num_pv_arg: number of possible values, this equals the number of bits
     //   that are set in pv_arg
@@ -265,6 +355,42 @@ void possible_values(puzzle_t * p, uint32_t locidx, uint32_t * pv_arg, uint32_t 
 
     *pv_arg = pv;
     *num_pv_arg = num_pv;
+}
+
+void * find_solutions_thread(void * cx) 
+{
+    puzzle_t *p = cx;
+
+    // keep track of number of times a thread is created (statistic)
+    num_thread_creates++;
+
+    // keep track of number of threads that are active;
+    // if this is the first thread created then 
+    //   keep track of the start time (statistic)
+    // endif
+    if (__sync_fetch_and_add(&num_threads, 1) == 0) {
+        find_solutions_start_us = microsec_timer();
+    }
+
+    // find solutions
+    find_solutions(*p, true);
+
+    // keep track of number of threads that are active;
+    // if this is the last thread that is exitting then
+    //   keep track of the completion time (statistic), and
+    //   set the done find_solutions_done flag
+    // endif
+    if (__sync_sub_and_fetch(&num_threads, 1) == 0) {
+        find_solutions_end_us = microsec_timer();
+        __sync_synchronize();
+        find_solutions_done = true;
+    }
+
+    // free cx arg
+    free(cx);
+
+    // return
+    return NULL;
 }
 
 // -----------------  READ & PRINT PUZZLE  -------------------------
@@ -394,7 +520,7 @@ void read_puzzle(puzzle_t * p, char * filename)
     fclose(fp);
 
     // print puzzle
-    print_puzzle(p, NULL);
+    print_puzzle(p, false, 0);
 
     // verify puzzle is valid by checking for presence of 1..9 or NO_VALUE in 
     // each row, column and grid, and no duplicates
@@ -413,35 +539,66 @@ void read_puzzle(puzzle_t * p, char * filename)
     }
 }
 
-void print_puzzle(puzzle_t * p, char * info_str)
+void print_puzzle(puzzle_t * p, bool print_stats, uint64_t ts)
 {
-    uint32_t row;
+    uint32_t line, row=0;
+    uint64_t us, rate;
+    char s[100];
 
-    for (row = 0; ; row++) {
-        if (row == 0 || row == 3 || row == 6 || row == 9) {
-            printf("+-------+-------+-------+%s\n",
-                   row == 0 && info_str ? info_str : "");
-            if (row == 9) {
-                break;
+    static pthread_mutex_t print_puzzle_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t last_us, last_ts;
+
+    pthread_mutex_lock(&print_puzzle_mutex);
+
+    for (line = 0; line <= 12; line++) {
+        if (line == 0 || line == 4 || line == 8 || line == 12) {
+            printf("+-------+-------+-------+");
+        } else {
+            uint8_t * v = &p->value[row*9];
+            printf("| %c %c %c | %c %c %c | %c %c %c |",
+                v[0] == NO_VALUE ? ' ' : v[0] + '0',
+                v[1] == NO_VALUE ? ' ' : v[1] + '0',
+                v[2] == NO_VALUE ? ' ' : v[2] + '0',
+                v[3] == NO_VALUE ? ' ' : v[3] + '0',
+                v[4] == NO_VALUE ? ' ' : v[4] + '0',
+                v[5] == NO_VALUE ? ' ' : v[5] + '0',
+                v[6] == NO_VALUE ? ' ' : v[6] + '0',
+                v[7] == NO_VALUE ? ' ' : v[7] + '0',
+                v[8] == NO_VALUE ? ' ' : v[8] + '0');
+            row++;
+        }
+
+        if (print_stats) {
+            if (line == 0) {
+                printf(" total_solutions     = %s", numeric_str(ts,s));
+            }
+            if (line == 1) {
+                printf(" num_thread_creates  = %d", num_threads);
+            }
+            if (line == 2) {
+                us = microsec_timer();
+                if (last_us != 0) {
+                    rate = (ts - last_ts) * 1000000L / (us - last_us);
+                    last_ts = ts;
+                    last_us = us;
+                    printf(" solutions_rate      = %s / sec", numeric_str(rate,s));        
+                } else {
+                    last_us = us;
+                    last_ts = ts;
+                }
             }
         }
-        uint8_t * v = &p->value[row*9];
-        printf("| %c %c %c | %c %c %c | %c %c %c |\n",
-               v[0] == NO_VALUE ? ' ' : v[0] + '0',
-               v[1] == NO_VALUE ? ' ' : v[1] + '0',
-               v[2] == NO_VALUE ? ' ' : v[2] + '0',
-               v[3] == NO_VALUE ? ' ' : v[3] + '0',
-               v[4] == NO_VALUE ? ' ' : v[4] + '0',
-               v[5] == NO_VALUE ? ' ' : v[5] + '0',
-               v[6] == NO_VALUE ? ' ' : v[6] + '0',
-               v[7] == NO_VALUE ? ' ' : v[7] + '0',
-               v[8] == NO_VALUE ? ' ' : v[8] + '0');
+
+        printf("\n");
     }
     printf("\n");
+
+    pthread_mutex_unlock(&print_puzzle_mutex);
 }
 
 // -----------------  VERIFY SLUTION  ------------------------------
 
+#ifdef VERIFY_SOLUTIONS
 void verify_solution(puzzle_t * p) 
 {
     uint32_t gli_tblidx;
@@ -458,6 +615,12 @@ void verify_solution(puzzle_t * p)
                 exit(1); \
             } \
         } while (0)
+
+    #define MAX_PRIOR_CHECKED_SOLUTIONS 1000000
+    static puzzle_t prior_checked_solutions[MAX_PRIOR_CHECKED_SOLUTIONS];
+    static uint32_t max_prior_checked_solutions;
+    uint32_t i;
+    static pthread_mutex_t verify_solution_mutex = PTHREAD_MUTEX_INITIALIZER;
 
     // if the solution is incorrect (indicates a program bug) then
     // - print error message
@@ -479,26 +642,84 @@ void verify_solution(puzzle_t * p)
               "grid", gli_tblidx);             
     }
 
-
-#ifdef DEBUG_DUPLICATES
-    // compare with prior solutions
-    #define MAX_PRIOR_CHECKED_SOLUTIONS 1000000
-    static puzzle_t prior_checked_solutions[MAX_PRIOR_CHECKED_SOLUTIONS];
-    static uint32_t max_prior_checked_solutions;
-    uint32_t i;
-
+    // check if this solution has already been found, and
+    // remember this solution so it can be compared with future solutions
     for (i = 0; i < max_prior_checked_solutions; i++) {
         if (memcmp(p, &prior_checked_solutions[i], sizeof(puzzle_t)) == 0) {
             printf("ERROR: this solution is a duplicate, exitting\n");
             exit(1);
         }
     }
-
-    // remember this solution so it can be compared with future solutions
+    pthread_mutex_lock(&verify_solution_mutex);
     if (max_prior_checked_solutions == MAX_PRIOR_CHECKED_SOLUTIONS) {
-        printf("WARNING: too many prior solutions for DEBUG_DUPLICATES, exitting\n");
-        exit(1);
+        static bool warning_printed = false;
+        if (warning_printed == false) {
+            printf("WARNING: too many solutions to continue checking for duplicates\n");
+            warning_printed = true;
+        }
+    } else {
+        prior_checked_solutions[max_prior_checked_solutions] = *p;
+        __sync_synchronize();
+        max_prior_checked_solutions++;
+        __sync_synchronize();
     }
-    prior_checked_solutions[max_prior_checked_solutions++] = *p;
-#endif
+    pthread_mutex_unlock(&verify_solution_mutex);
 }
+#endif
+
+// -----------------  UTILS - TIME  --------------------------------
+
+uint64_t microsec_timer(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    return  ((uint64_t)ts.tv_sec * 1000000) + ((uint64_t)ts.tv_nsec / 1000);
+}
+
+// -----------------  UTILS - SIGINT  ------------------------------
+
+bool ctrl_c;
+
+void sigint_handler(int sig);
+
+void sigint_register(void)
+{
+    struct sigaction act;
+
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = sigint_handler;
+    sigaction(SIGINT, &act, NULL);
+}
+
+void sigint_handler(int sig)
+{
+    ctrl_c = true;
+}
+
+bool sigint_check(void)
+{
+    return ctrl_c;
+}
+
+void sigint_clear(void)
+{
+    ctrl_c = false;
+}
+
+// -----------------  UTILS - NUMBER TO STRING  --------------------
+
+char * numeric_str(uint64_t v, char * s)
+{
+    if (v < 1000L) {
+        sprintf(s, "%lu", v);
+    } else if (v < 1000000L) {
+        sprintf(s, "%.3f thousand", (double)v/1000);
+    } else if (v < 1000000000L) {
+        sprintf(s, "%.3f million", (double)v/1000000);
+    } else {
+        sprintf(s, "%.3f billion", (double)v/1000000000);
+    }
+    return s;
+}
+
