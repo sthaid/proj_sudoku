@@ -224,21 +224,38 @@ void find_solutions(puzzle_t p, bool new_thread)
         return;
     }
 
-    // if not currently executing in a newly created thrad and 
+    // if not currently executing in a newly created thread and 
     //    the number of threads running find_solutions is less than maximum 
     // then
-    //   create a thread which will call find_solutions
+    //   create a thread which will call find_solutions, and
     //   return
     // endif
     if (!new_thread && num_threads < max_threads) {
+        // acquire the mutex and check again to confirm that a thread needs to be created
         pthread_mutex_lock(&thread_create_mutex);
         if (num_threads < max_threads) {
+            // keep track of number of times a thread is created statistic
+            num_thread_creates++;
+
+            // keep track of number of threads that are active;
+            // if this is the first thread created then 
+            //   keep track of the start time statistic
+            // endif
+            if (__sync_fetch_and_add(&num_threads, 1) == 0) {
+                find_solutions_start_us = microsec_timer();
+            }
+
+            // create the new find_solutions_thread
             p_copy = malloc(sizeof(puzzle_t));
             *p_copy = p;
             pthread_create(&thread_id, NULL, find_solutions_thread, p_copy);
+
+            // release the mutex and return
             pthread_mutex_unlock(&thread_create_mutex);
             return;
         }
+
+        // we didn't create the thread, release the mutex and continue
         pthread_mutex_unlock(&thread_create_mutex);
     }
 
@@ -361,24 +378,13 @@ void * find_solutions_thread(void * cx)
 {
     puzzle_t *p = cx;
 
-    // keep track of number of times a thread is created (statistic)
-    num_thread_creates++;
-
-    // keep track of number of threads that are active;
-    // if this is the first thread created then 
-    //   keep track of the start time (statistic)
-    // endif
-    if (__sync_fetch_and_add(&num_threads, 1) == 0) {
-        find_solutions_start_us = microsec_timer();
-    }
-
     // find solutions
     find_solutions(*p, true);
 
-    // keep track of number of threads that are active;
+    // keep track of number of threads that are active; and
     // if this is the last thread that is exitting then
-    //   keep track of the completion time (statistic), and
-    //   set the done find_solutions_done flag
+    //   keep track of the completion time statistic, and
+    //   set the find_solutions_done flag
     // endif
     if (__sync_sub_and_fetch(&num_threads, 1) == 0) {
         find_solutions_end_us = microsec_timer();
