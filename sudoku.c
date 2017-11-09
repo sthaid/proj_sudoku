@@ -205,7 +205,7 @@ void initialize(void)
 void find_solutions(puzzle_t p, bool new_thread)
 {
     uint32_t   locidx, num_pv, pv;
-    uint32_t   best_num_pv, best_locidx, best_pv;
+    uint32_t   best_num_pv, best_locidx=-1, best_pv=-1;
     uint64_t   ts;
     uint8_t    trial_val;
     bool       values_have_been_set;
@@ -333,6 +333,7 @@ void find_solutions(puzzle_t p, bool new_thread)
 
     // assert that the above code has set best_num_pv, best_locidx, and best_pv
     assert(best_num_pv >= 2 && best_num_pv <= 9);
+    assert(best_pv != -1 && best_locidx != -1);
 
     // using the locidx with the least number of possible values, recursively
     // call find_solutions with that location set to each of the possible values
