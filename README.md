@@ -2,6 +2,6 @@
 
 C Language program to solve Sudoku puzzles.
 
-# Usage Example: 
+# Usage Example:  
 
 ./sudoku easy.dat
